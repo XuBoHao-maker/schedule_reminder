@@ -17,6 +17,7 @@ from .core import (
     APP_DISPLAY_NAME,
     APP_NAME,
     APP_VERSION,
+    WEEKDAYS_CN,
     AppPaths,
     Settings,
     SettingsStore,
@@ -138,7 +139,7 @@ class ScrollableFrame(tk.Frame):
         )
         self.inner.bind("<Configure>", self._on_inner_configure)
         self.canvas.bind("<Configure>", self._on_canvas_configure)
-        self.canvas.bind_all("<MouseWheel>", self._on_wheel)
+        self.canvas.bind_all("<MouseWheel>", self._on_wheel, add="+")
 
     def _on_inner_configure(self, _event: tk.Event) -> None:
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
@@ -380,7 +381,7 @@ class ReminderDialog:
         buttons.grid_columnconfigure(1, weight=1)
         self.cancel_button = app.make_button(
             buttons,
-            "取消待办",
+            "关闭提醒",
             self._cancel,
             kind="ghost",
         )
@@ -406,7 +407,7 @@ class ReminderDialog:
         self.error_label.pack(fill="x", padx=28, pady=(8, 0))
         tk.Label(
             self.card,
-            text="此弹窗不会自动关闭，请选择“取消待办”或“稍后提醒”。",
+            text="此弹窗不会自动关闭。关闭提醒后，该待办会保留在当天列表中。",
             bg=COLORS["card"],
             fg=COLORS["muted"],
             font=(app.font_family, 8),
@@ -445,7 +446,7 @@ class ReminderDialog:
     def _cancel(self) -> None:
         if self.closed:
             return
-        if not self.app.cancel_todo(self.todo.id):
+        if not self.app.close_reminder(self.todo.id):
             return
         self._close()
 
@@ -498,6 +499,11 @@ class ScheduleReminderApp:
         self.selected_date = date.today()
         self.view_year = self.selected_date.year
         self.view_month = self.selected_date.month
+        self.view_mode = "month"
+        self.month_picker_year = self.view_year
+        self.month_picker_open = False
+        self.time_picker_open = False
+        self._today_button_visible = True
         self.reminder_dialog: ReminderDialog | None = None
         self._closing = False
         self._day_cells: list[DayCell] = []
@@ -511,6 +517,8 @@ class ScheduleReminderApp:
         self._build_ui()
         self._set_default_time()
         self._refresh_all()
+        self.root.bind("<Button-1>", self._on_root_click, add="+")
+        self.root.bind("<Escape>", self._on_escape, add="+")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.report_callback_exception = self._report_callback_exception
         if self.load_error:
@@ -605,34 +613,69 @@ class ScheduleReminderApp:
 
     def _build_calendar(self, parent: tk.Frame) -> None:
         family = self.font_family
+        self.calendar_card = parent
         inner = tk.Frame(parent, bg=COLORS["card"])
         inner.pack(fill="both", expand=True, padx=20, pady=18)
+        self.calendar_inner = inner
 
         month_bar = tk.Frame(inner, bg=COLORS["card"])
         month_bar.pack(fill="x", pady=(0, 12))
+        self.month_bar = month_bar
         self.prev_button = self.make_button(
             month_bar, "‹", self.previous_month, kind="circle"
         )
         self.prev_button.pack(side="left")
-        self.month_label = tk.Label(
+
+        self.view_toggle = tk.Canvas(
             month_bar,
-            text="",
+            width=36,
+            height=36,
             bg=COLORS["card"],
-            fg=COLORS["ink"],
-            font=(family, 17, "bold"),
+            highlightthickness=1,
+            highlightbackground=COLORS["line"],
+            cursor="hand2",
+            takefocus=1,
         )
-        self.month_label.pack(side="left", expand=True)
+        self.view_toggle.pack(side="right", padx=(8, 0))
+        self.view_toggle.bind("<Button-1>", lambda _event: self.toggle_view())
+        self.view_toggle.bind("<Return>", lambda _event: self.toggle_view())
+        self.view_toggle.bind("<space>", lambda _event: self.toggle_view())
+
         self.next_button = self.make_button(
             month_bar, "›", self.next_month, kind="circle"
         )
         self.next_button.pack(side="right")
 
-        weekdays = tk.Frame(inner, bg=COLORS["card"])
-        weekdays.pack(fill="x", pady=(0, 5))
+        self.month_title = tk.Frame(
+            month_bar, bg=COLORS["card"], cursor="hand2"
+        )
+        self.month_title.pack(side="left", expand=True)
+        self.month_label = tk.Label(
+            self.month_title,
+            text="",
+            bg=COLORS["card"],
+            fg=COLORS["ink"],
+            font=(family, 17, "bold"),
+            cursor="hand2",
+        )
+        self.month_label.pack(side="left")
+        self.month_arrow = tk.Label(
+            self.month_title,
+            text="▾",
+            bg=COLORS["card"],
+            fg=COLORS["muted"],
+            font=(family, 9),
+            cursor="hand2",
+        )
+        self.month_arrow.pack(side="left", padx=(4, 0))
+        for widget in (self.month_title, self.month_label, self.month_arrow):
+            widget.bind("<Button-1>", lambda _event: self.toggle_month_picker())
+
+        self.weekdays = tk.Frame(inner, bg=COLORS["card"])
         for column, name in enumerate(("一", "二", "三", "四", "五", "六", "日")):
-            weekdays.grid_columnconfigure(column, weight=1)
+            self.weekdays.grid_columnconfigure(column, weight=1)
             tk.Label(
-                weekdays,
+                self.weekdays,
                 text=name,
                 bg=COLORS["card"],
                 fg=COLORS["accent_deep"] if column >= 5 else COLORS["muted"],
@@ -640,16 +683,81 @@ class ScheduleReminderApp:
             ).grid(row=0, column=column, sticky="ew")
 
         self.calendar_grid = tk.Frame(inner, bg=COLORS["card"])
-        self.calendar_grid.pack(fill="both", expand=True)
         for column in range(7):
             self.calendar_grid.grid_columnconfigure(column, weight=1, uniform="day")
         for row in range(6):
             self.calendar_grid.grid_rowconfigure(row, weight=1, uniform="day")
 
+        self.timeline_scroll = ScrollableFrame(inner, COLORS["card"])
+
+        self.month_picker = tk.Toplevel(self.root)
+        self.month_picker.withdraw()
+        self.month_picker.overrideredirect(True)
+        self.month_picker.transient(self.root)
+        self.month_picker.attributes("-topmost", True)
+        self.month_picker.configure(bg=COLORS["line_strong"])
+        self.month_picker.bind("<Escape>", lambda _event: self.hide_month_picker())
+        self.month_picker_card = tk.Frame(self.month_picker, bg=COLORS["card"])
+        self.month_picker_card.pack(fill="both", expand=True, padx=1, pady=1)
+
+        self._show_month_layout()
+        self._draw_view_toggle()
+
+    def _show_month_layout(self) -> None:
+        self.timeline_scroll.pack_forget()
+        if not self.weekdays.winfo_ismapped():
+            self.weekdays.pack(fill="x", pady=(0, 5))
+        if not self.calendar_grid.winfo_ismapped():
+            self.calendar_grid.pack(fill="both", expand=True)
+
+    def _show_timeline_layout(self) -> None:
+        self.calendar_grid.pack_forget()
+        self.weekdays.pack_forget()
+        if not self.timeline_scroll.winfo_ismapped():
+            self.timeline_scroll.pack(fill="both", expand=True)
+
+    def _draw_view_toggle(self) -> None:
+        canvas = self.view_toggle
+        canvas.delete("all")
+        canvas.create_rectangle(
+            7,
+            7,
+            29,
+            29,
+            outline=COLORS["ink_soft"],
+            width=1,
+        )
+        if self.view_mode == "month":
+            for x, y in ((10, 10), (20, 10), (10, 20), (20, 20)):
+                canvas.create_rectangle(
+                    x,
+                    y,
+                    x + 6,
+                    y + 6,
+                    outline=COLORS["accent"],
+                    fill=COLORS["accent_soft"],
+                    width=1,
+                )
+        else:
+            canvas.create_rectangle(
+                10, 11, 26, 15, outline=COLORS["accent"], fill=COLORS["accent_soft"]
+            )
+            canvas.create_rectangle(
+                10, 21, 26, 25, outline=COLORS["accent"], fill=COLORS["accent_soft"]
+            )
+
+    def toggle_view(self) -> None:
+        self.hide_month_picker()
+        self.hide_time_picker()
+        self.view_mode = "timeline" if self.view_mode == "month" else "month"
+        self._draw_view_toggle()
+        self._refresh_calendar()
+
     def _build_panel(self, parent: tk.Frame) -> None:
         family = self.font_family
         inner = tk.Frame(parent, bg=COLORS["card"])
         inner.pack(fill="both", expand=True, padx=22, pady=19)
+        self.panel_inner = inner
 
         head = tk.Frame(inner, bg=COLORS["card"])
         head.pack(fill="x")
@@ -734,6 +842,7 @@ class ScheduleReminderApp:
             width=9,
         )
         self.time_entry.pack(fill="x", ipady=7, pady=(5, 0))
+        self.time_entry.bind("<Button-1>", lambda _event: self.show_time_picker())
         self.add_button = self.make_button(
             time_row, "添加待办", self.add_todo, kind="primary"
         )
@@ -787,6 +896,16 @@ class ScheduleReminderApp:
             justify="left",
             wraplength=330,
         ).pack(fill="x", pady=(10, 0))
+
+        self.time_picker = tk.Toplevel(self.root)
+        self.time_picker.withdraw()
+        self.time_picker.overrideredirect(True)
+        self.time_picker.transient(self.root)
+        self.time_picker.attributes("-topmost", True)
+        self.time_picker.configure(bg=COLORS["line_strong"])
+        self.time_picker.bind("<Escape>", lambda _event: self.hide_time_picker())
+        self.time_picker_card = tk.Frame(self.time_picker, bg=COLORS["card"])
+        self.time_picker_card.pack(fill="both", expand=True, padx=1, pady=1)
 
     def make_button(
         self,
@@ -842,6 +961,355 @@ class ScheduleReminderApp:
             }
         return tk.Button(parent, text=text, command=command, **options)
 
+    def _position_popup(
+        self,
+        popup: tk.Toplevel,
+        anchor: tk.Widget,
+        width: int,
+    ) -> None:
+        popup.update_idletasks()
+        anchor.update_idletasks()
+        height = max(120, popup.winfo_reqheight())
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        x = anchor.winfo_rootx()
+        y = anchor.winfo_rooty() + anchor.winfo_height() + 5
+        x = max(0, min(x, screen_width - width - 8))
+        if y + height > screen_height - 8:
+            y = max(8, anchor.winfo_rooty() - height - 5)
+        popup.geometry(f"{width}x{height}+{x}+{y}")
+        popup.deiconify()
+        popup.lift()
+        popup.attributes("-topmost", True)
+
+    @staticmethod
+    def _is_descendant(widget: tk.Misc, ancestor: tk.Misc) -> bool:
+        current: tk.Misc | None = widget
+        while current is not None:
+            if current is ancestor:
+                return True
+            if isinstance(current, tk.Toplevel):
+                break
+            current = getattr(current, "master", None)
+        return False
+
+    def toggle_month_picker(self) -> None:
+        if self.month_picker_open:
+            self.hide_month_picker()
+            return
+        self.hide_time_picker()
+        self.month_picker_year = self.view_year
+        self._render_month_picker()
+        self.month_picker_open = True
+        self.month_picker.lift()
+        self._position_popup(
+            self.month_picker,
+            self.month_title,
+            300,
+        )
+        self.root.after_idle(self.month_picker.lift)
+        self.root.after(80, self._raise_month_picker)
+
+    def hide_month_picker(self) -> None:
+        if not self.month_picker_open and not self.month_picker.winfo_ismapped():
+            return
+        self.month_picker.withdraw()
+        self.month_picker_open = False
+
+    def _raise_month_picker(self) -> None:
+        if self.month_picker_open:
+            self.month_picker.lift()
+
+    def _render_month_picker(self) -> None:
+        for child in self.month_picker_card.winfo_children():
+            child.destroy()
+        family = self.font_family
+        header = tk.Frame(self.month_picker_card, bg=COLORS["card"])
+        header.pack(fill="x", padx=12, pady=(11, 7))
+        previous_year = tk.Button(
+            header,
+            text="‹",
+            command=lambda: self.change_picker_year(-1),
+            bg=COLORS["warm"],
+            fg=COLORS["ink_soft"],
+            activebackground=COLORS["accent_soft"],
+            activeforeground=COLORS["accent_deep"],
+            font=(family, 14),
+            relief="flat",
+            bd=0,
+            width=2,
+            cursor="hand2",
+        )
+        previous_year.pack(side="left")
+        tk.Label(
+            header,
+            text=f"{self.month_picker_year}年",
+            bg=COLORS["card"],
+            fg=COLORS["ink"],
+            font=(family, 12, "bold"),
+        ).pack(side="left", expand=True)
+        next_year = tk.Button(
+            header,
+            text="›",
+            command=lambda: self.change_picker_year(1),
+            bg=COLORS["warm"],
+            fg=COLORS["ink_soft"],
+            activebackground=COLORS["accent_soft"],
+            activeforeground=COLORS["accent_deep"],
+            font=(family, 14),
+            relief="flat",
+            bd=0,
+            width=2,
+            cursor="hand2",
+        )
+        next_year.pack(side="right")
+
+        grid = tk.Frame(self.month_picker_card, bg=COLORS["card"])
+        grid.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        for column in range(3):
+            grid.grid_columnconfigure(column, weight=1)
+        for row in range(4):
+            grid.grid_rowconfigure(row, weight=1)
+        today = date.today()
+        for index in range(12):
+            month = index + 1
+            selected = (
+                self.month_picker_year == self.view_year
+                and month == self.view_month
+            )
+            is_current = (
+                self.month_picker_year == today.year and month == today.month
+            )
+            background = COLORS["accent"] if selected else COLORS["warm"]
+            foreground = COLORS["white"] if selected else COLORS["ink_soft"]
+            if not selected and is_current:
+                background = COLORS["accent_soft"]
+                foreground = COLORS["accent_deep"]
+            button = tk.Button(
+                grid,
+                text=f"{month}月",
+                command=lambda chosen=month: self.choose_month(chosen),
+                bg=background,
+                fg=foreground,
+                activebackground=COLORS["accent_soft"],
+                activeforeground=COLORS["accent_deep"],
+                font=(family, 9, "bold" if selected or is_current else "normal"),
+                relief="flat",
+                bd=0,
+                highlightthickness=1,
+                highlightbackground=COLORS["line"],
+                cursor="hand2",
+            )
+            button.grid(
+                row=index // 3,
+                column=index % 3,
+                sticky="nsew",
+                padx=3,
+                pady=3,
+            )
+
+    def change_picker_year(self, delta: int) -> None:
+        self.month_picker_year += delta
+        self._render_month_picker()
+        self._position_popup(
+            self.month_picker,
+            self.month_title,
+            300,
+        )
+
+    def choose_month(self, month: int) -> None:
+        self.view_year = self.month_picker_year
+        self.view_month = month
+        self.hide_month_picker()
+        self._refresh_calendar()
+
+    def show_time_picker(self) -> None:
+        if self.time_picker_open:
+            return
+        self.hide_month_picker()
+        try:
+            current = parse_time_text(self.time_var.get())
+        except ValidationError:
+            current = datetime.now().time()
+        self._render_time_picker(current.hour, current.minute)
+        self.time_picker_open = True
+        self.time_picker.lift()
+        self._position_popup(
+            self.time_picker,
+            self.time_entry,
+            258,
+        )
+        self.root.after_idle(self.time_picker.lift)
+        self.root.after(30, self._focus_time_picker)
+        self.root.after(80, self._raise_time_picker)
+
+    def _focus_time_picker(self) -> None:
+        if not self.time_picker_open:
+            return
+        try:
+            self._time_hour_list.focus_set()
+            self._time_hour_list.see(self._time_hour_list.curselection()[0])
+        except (AttributeError, IndexError, tk.TclError):
+            pass
+
+    def hide_time_picker(self) -> None:
+        if not self.time_picker_open and not self.time_picker.winfo_ismapped():
+            return
+        self.time_picker.withdraw()
+        self.time_picker_open = False
+
+    def _raise_time_picker(self) -> None:
+        if self.time_picker_open:
+            self.time_picker.lift()
+
+    def _render_time_picker(self, hour: int, minute: int) -> None:
+        for child in self.time_picker_card.winfo_children():
+            child.destroy()
+        family = self.font_family
+        tk.Label(
+            self.time_picker_card,
+            text="选择提醒时间",
+            bg=COLORS["card"],
+            fg=COLORS["ink"],
+            font=(family, 10, "bold"),
+        ).pack(anchor="w", padx=14, pady=(11, 1))
+        tk.Label(
+            self.time_picker_card,
+            text="上下滚动或点击选择",
+            bg=COLORS["card"],
+            fg=COLORS["muted"],
+            font=(family, 8),
+        ).pack(anchor="w", padx=14, pady=(0, 7))
+
+        columns = tk.Frame(self.time_picker_card, bg=COLORS["card"])
+        columns.pack(fill="both", expand=True, padx=12)
+        columns.grid_columnconfigure(0, weight=1)
+        columns.grid_columnconfigure(1, weight=1)
+        hours_column = self._make_time_column(columns, "小时", 0, 24, hour)
+        minutes_column = self._make_time_column(columns, "分钟", 1, 60, minute)
+        self._time_hour_list = hours_column
+        self._time_minute_list = minutes_column
+
+        buttons = tk.Frame(self.time_picker_card, bg=COLORS["card"])
+        buttons.pack(fill="x", padx=12, pady=(8, 12))
+        buttons.grid_columnconfigure(0, weight=1)
+        buttons.grid_columnconfigure(1, weight=1)
+        cancel = self.make_button(
+            buttons, "取消", self.hide_time_picker, kind="ghost"
+        )
+        cancel.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        confirm = self.make_button(
+            buttons, "确定", self.confirm_time_picker, kind="primary"
+        )
+        confirm.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+
+    def _make_time_column(
+        self,
+        parent: tk.Frame,
+        label: str,
+        column: int,
+        count: int,
+        selected: int,
+    ) -> tk.Listbox:
+        family = self.font_family
+        frame = tk.Frame(parent, bg=COLORS["card"])
+        frame.grid(row=0, column=column, sticky="nsew", padx=3)
+        tk.Label(
+            frame,
+            text=label,
+            bg=COLORS["card"],
+            fg=COLORS["muted"],
+            font=(family, 8, "bold"),
+        ).pack(anchor="w", pady=(0, 3))
+        list_row = tk.Frame(frame, bg=COLORS["card"])
+        list_row.pack(fill="both", expand=True)
+        listbox = tk.Listbox(
+            list_row,
+            height=7,
+            width=4,
+            exportselection=False,
+            selectmode="browse",
+            activestyle="none",
+            font=(family, 10),
+            bg=COLORS["warm"],
+            fg=COLORS["ink"],
+            selectbackground=COLORS["accent"],
+            selectforeground=COLORS["white"],
+            highlightthickness=1,
+            highlightbackground=COLORS["line"],
+            relief="flat",
+            bd=0,
+            justify="center",
+        )
+        scrollbar = tk.Scrollbar(
+            list_row, orient="vertical", command=listbox.yview, width=10
+        )
+        listbox.configure(yscrollcommand=scrollbar.set)
+        listbox.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        for value in range(count):
+            listbox.insert("end", f"{value:02d}")
+        listbox.selection_set(selected)
+        listbox.activate(selected)
+        listbox.see(selected)
+        listbox.bind(
+            "<MouseWheel>",
+            lambda event, widget=listbox, total=count: self._scroll_time_listbox(
+                event, widget, total
+            ),
+        )
+        return listbox
+
+    def _scroll_time_listbox(
+        self, event: tk.Event, listbox: tk.Listbox, count: int
+    ) -> str:
+        if not listbox.winfo_exists():
+            return "break"
+        selected = listbox.curselection()
+        index = selected[0] if selected else 0
+        direction = -1 if event.delta > 0 else 1
+        index = max(0, min(count - 1, index + direction))
+        listbox.selection_clear(0, "end")
+        listbox.selection_set(index)
+        listbox.activate(index)
+        listbox.see(index)
+        return "break"
+
+    def confirm_time_picker(self) -> None:
+        try:
+            hour = int(self._time_hour_list.get(self._time_hour_list.curselection()[0]))
+            minute = int(
+                self._time_minute_list.get(self._time_minute_list.curselection()[0])
+            )
+        except (AttributeError, IndexError, tk.TclError, ValueError):
+            self.hide_time_picker()
+            return
+        self.time_var.set(f"{hour:02d}:{minute:02d}")
+        self.hide_time_picker()
+        self.time_entry.focus_set()
+
+    def _on_root_click(self, event: tk.Event) -> None:
+        widget = event.widget
+        if self.month_picker_open and not (
+            self._is_descendant(widget, self.month_picker)
+            or self._is_descendant(widget, self.month_title)
+        ):
+            self.hide_month_picker()
+        if self.time_picker_open and not (
+            self._is_descendant(widget, self.time_picker)
+            or self._is_descendant(widget, self.time_entry)
+        ):
+            self.hide_time_picker()
+
+    def _on_escape(self, _event: tk.Event) -> str | None:
+        if self.month_picker_open:
+            self.hide_month_picker()
+            return "break"
+        if self.time_picker_open:
+            self.hide_time_picker()
+            return "break"
+        return None
+
     def _set_default_time(self) -> None:
         if self.selected_date != date.today():
             self.time_var.set("09:00")
@@ -863,25 +1331,121 @@ class ScheduleReminderApp:
             child.destroy()
         self._day_cells.clear()
         self.month_label.configure(text=f"{self.view_year}年{self.view_month}月")
-        counts: dict[date, int] = {}
-        for todo in self.todos:
-            counts[todo.due_date] = counts.get(todo.due_date, 0) + 1
-        weeks = calendar.Calendar(firstweekday=0).monthdatescalendar(
-            self.view_year, self.view_month
-        )
-        while len(weeks) < 6:
-            last = weeks[-1][-1]
-            weeks.append([last + timedelta(days=offset) for offset in range(1, 8)])
-        today = date.today()
-        for row, week in enumerate(weeks[:6]):
-            for column, day in enumerate(week):
-                cell = DayCell(self.calendar_grid, self, day, counts.get(day, 0))
-                cell.grid(row=row, column=column, sticky="nsew", padx=2, pady=2)
-                cell.set_state(
-                    selected=day == self.selected_date,
-                    today=day == today,
-                )
-                self._day_cells.append(cell)
+        if self.view_mode == "timeline":
+            self._show_timeline_layout()
+            self._render_timeline()
+        else:
+            self._show_month_layout()
+            counts: dict[date, int] = {}
+            for todo in self.todos:
+                counts[todo.due_date] = counts.get(todo.due_date, 0) + 1
+            weeks = calendar.Calendar(firstweekday=0).monthdatescalendar(
+                self.view_year, self.view_month
+            )
+            while len(weeks) < 6:
+                last = weeks[-1][-1]
+                weeks.append([last + timedelta(days=offset) for offset in range(1, 8)])
+            today = date.today()
+            for row, week in enumerate(weeks[:6]):
+                for column, day in enumerate(week):
+                    cell = DayCell(self.calendar_grid, self, day, counts.get(day, 0))
+                    cell.grid(row=row, column=column, sticky="nsew", padx=2, pady=2)
+                    cell.set_state(
+                        selected=day == self.selected_date,
+                        today=day == today,
+                    )
+                    self._day_cells.append(cell)
+        self._update_today_button()
+
+    def _render_timeline(self) -> None:
+        family = self.font_family
+        for child in self.timeline_scroll.inner.winfo_children():
+            child.destroy()
+        _, last_day = calendar.monthrange(self.view_year, self.view_month)
+        for day_number in range(1, last_day + 1):
+            day = date(self.view_year, self.view_month, day_number)
+            selected = day == self.selected_date
+            background = COLORS["warm"] if selected else COLORS["card"]
+            group = tk.Frame(
+                self.timeline_scroll.inner,
+                bg=background,
+                highlightbackground=(
+                    COLORS["accent_soft"] if selected else COLORS["line"]
+                ),
+                highlightthickness=1,
+            )
+            group.pack(fill="x", padx=2, pady=(0, 7))
+            header = tk.Frame(group, bg=background)
+            header.pack(fill="x", padx=12, pady=(8, 4))
+            tk.Label(
+                header,
+                text=f"{day.month}月{day.day}日 {WEEKDAYS_CN[day.weekday()]}",
+                bg=background,
+                fg=COLORS["accent_deep"] if selected else COLORS["ink"],
+                font=(family, 9, "bold"),
+                anchor="w",
+            ).pack(side="left")
+            if selected:
+                tk.Label(
+                    header,
+                    text="选中",
+                    bg=COLORS["accent_soft"],
+                    fg=COLORS["accent_deep"],
+                    font=(family, 7, "bold"),
+                    padx=6,
+                    pady=1,
+                ).pack(side="right")
+            day_todos = todos_for_date(self.todos, day)
+            if not day_todos:
+                tk.Label(
+                    group,
+                    text="当日无日程安排",
+                    bg=background,
+                    fg=COLORS["muted"],
+                    font=(family, 8),
+                    anchor="w",
+                ).pack(fill="x", padx=14, pady=(0, 9))
+                continue
+            for todo in day_todos:
+                row = tk.Frame(group, bg=background)
+                row.pack(fill="x", padx=12, pady=(0, 5))
+                fired = todo.fired_at is not None
+                tk.Label(
+                    row,
+                    text=format_time_text(todo.remind_time),
+                    bg=background,
+                    fg=COLORS["muted"] if fired else COLORS["accent_deep"],
+                    font=(family, 8, "bold"),
+                    width=6,
+                    anchor="w",
+                ).pack(side="left")
+                tk.Label(
+                    row,
+                    text=todo.title,
+                    bg=background,
+                    fg=COLORS["muted"] if fired else COLORS["ink"],
+                    font=(family, 8, "normal" if fired else "bold"),
+                    anchor="w",
+                    justify="left",
+                    wraplength=210,
+                ).pack(side="left", fill="x", expand=True)
+                tk.Label(
+                    row,
+                    text="已提醒" if fired else "待提醒",
+                    bg=background,
+                    fg=COLORS["muted"] if fired else COLORS["green"],
+                    font=(family, 7),
+                ).pack(side="right", padx=(5, 0))
+            tk.Frame(group, height=5, bg=background).pack(fill="x")
+
+    def _update_today_button(self) -> None:
+        should_show = self.selected_date != date.today()
+        if should_show and not self._today_button_visible:
+            self.today_button.pack(side="right", pady=(5, 0))
+            self._today_button_visible = True
+        elif not should_show and self._today_button_visible:
+            self.today_button.pack_forget()
+            self._today_button_visible = False
 
     def _refresh_panel(self) -> None:
         self.selected_label.configure(text=format_date_cn(self.selected_date))
@@ -895,6 +1459,7 @@ class ScheduleReminderApp:
         if is_past and not self.form_hint.cget("text"):
             self.form_hint.configure(text="过去日期不能新增提醒，请选择今天或之后的日期。")
         self._refresh_todo_list(selected_todos)
+        self._update_today_button()
 
     def _refresh_todo_list(self, selected_todos: list[Todo]) -> None:
         for child in self.todo_scroll.inner.winfo_children():
@@ -928,9 +1493,11 @@ class ScheduleReminderApp:
 
     def _build_todo_row(self, todo: Todo) -> None:
         family = self.font_family
+        fired = todo.fired_at is not None
+        row_bg = "#f2ece1" if fired else COLORS["warm"]
         row = tk.Frame(
             self.todo_scroll.inner,
-            bg=COLORS["warm"],
+            bg=row_bg,
             highlightbackground=COLORS["line"],
             highlightthickness=1,
         )
@@ -939,8 +1506,8 @@ class ScheduleReminderApp:
         tk.Label(
             row,
             text=format_time_text(todo.remind_time),
-            bg=COLORS["warm"],
-            fg=COLORS["accent_deep"],
+            bg=row_bg,
+            fg=COLORS["muted"] if fired else COLORS["accent_deep"],
             font=(family, 9, "bold"),
             width=7,
             anchor="w",
@@ -948,23 +1515,26 @@ class ScheduleReminderApp:
         tk.Label(
             row,
             text=todo.title,
-            bg=COLORS["warm"],
-            fg=COLORS["ink"],
-            font=(family, 9, "bold"),
+            bg=row_bg,
+            fg=COLORS["muted"] if fired else COLORS["ink"],
+            font=(family, 9, "normal" if fired else "bold"),
             anchor="w",
             justify="left",
             wraplength=210,
         ).grid(row=0, column=1, sticky="ew", pady=(10, 0))
-        meta = (
-            f"已稍后至 {format_datetime_cn(todo.snoozed_until)}"
-            if todo.snoozed_until
-            else "等待提醒"
-        )
+        if fired:
+            meta = f"已提醒 {todo.fired_at.strftime('%H:%M')}"
+        elif todo.snoozed_until:
+            meta = f"已稍后至 {format_datetime_cn(todo.snoozed_until)}"
+        else:
+            meta = "等待提醒"
         tk.Label(
             row,
             text=meta,
-            bg=COLORS["warm"],
-            fg=COLORS["green"] if todo.snoozed_until else COLORS["muted"],
+            bg=row_bg,
+            fg=COLORS["muted"] if fired else (
+                COLORS["green"] if todo.snoozed_until else COLORS["muted"]
+            ),
             font=(family, 8),
             anchor="w",
             justify="left",
@@ -974,7 +1544,7 @@ class ScheduleReminderApp:
             row,
             text="删除",
             command=lambda item_id=todo.id: self.delete_todo(item_id),
-            bg=COLORS["warm"],
+            bg=row_bg,
             fg=COLORS["muted"],
             activebackground=COLORS["accent_soft"],
             activeforeground=COLORS["red"],
@@ -987,6 +1557,8 @@ class ScheduleReminderApp:
     def select_date(self, selected: date) -> None:
         if selected == self.selected_date:
             return
+        self.hide_month_picker()
+        self.hide_time_picker()
         self.selected_date = selected
         self.view_year = selected.year
         self.view_month = selected.month
@@ -995,6 +1567,8 @@ class ScheduleReminderApp:
         self._refresh_all()
 
     def previous_month(self) -> None:
+        self.hide_month_picker()
+        self.hide_time_picker()
         year, month = self.view_year, self.view_month - 1
         if month == 0:
             year, month = year - 1, 12
@@ -1002,6 +1576,8 @@ class ScheduleReminderApp:
         self._refresh_calendar()
 
     def next_month(self) -> None:
+        self.hide_month_picker()
+        self.hide_time_picker()
         year, month = self.view_year, self.view_month + 1
         if month == 13:
             year, month = year + 1, 1
@@ -1009,6 +1585,8 @@ class ScheduleReminderApp:
         self._refresh_calendar()
 
     def go_today(self) -> None:
+        self.hide_month_picker()
+        self.hide_time_picker()
         self.selected_date = date.today()
         self.view_year = self.selected_date.year
         self.view_month = self.selected_date.month
@@ -1054,11 +1632,20 @@ class ScheduleReminderApp:
             return
         self._remove_todo(todo, confirm=False)
 
-    def cancel_todo(self, todo_id: str) -> bool:
+    def close_reminder(self, todo_id: str) -> bool:
+        """Close the popup but keep the todo as handled history."""
         todo = next((item for item in self.todos if item.id == todo_id), None)
         if todo is None:
             return True
-        return self._remove_todo(todo, confirm=False)
+        previous_fired = todo.fired_at
+        if todo.fired_at is None:
+            todo.mark_fired()
+            if not self._save_todos():
+                todo.fired_at = previous_fired
+                return False
+        self._refresh_all()
+        self._set_form_message("提醒已关闭，记录已保留。")
+        return True
 
     def _remove_todo(self, todo: Todo, *, confirm: bool = True) -> bool:
         if confirm and not messagebox.askyesno(
@@ -1079,6 +1666,7 @@ class ScheduleReminderApp:
             return True
         previous_until = todo.snoozed_until
         previous_count = todo.snooze_count
+        previous_fired = todo.fired_at
         try:
             todo.snooze(minutes)
         except ValidationError as exc:
@@ -1087,6 +1675,7 @@ class ScheduleReminderApp:
         if not self._save_todos():
             todo.snoozed_until = previous_until
             todo.snooze_count = previous_count
+            todo.fired_at = previous_fired
             return False
         self.settings.snooze_minutes = minutes
         try:
@@ -1104,9 +1693,20 @@ class ScheduleReminderApp:
             self._show_reminder(due[0])
 
     def _show_reminder(self, todo: Todo) -> None:
+        self.hide_month_picker()
+        self.hide_time_picker()
+        previous_fired = todo.fired_at
+        todo.mark_fired()
+        if not self._save_todos():
+            todo.fired_at = previous_fired
+            return
+        self._refresh_all()
         try:
             self.reminder_dialog = ReminderDialog(self, todo)
         except Exception:
+            todo.fired_at = previous_fired
+            self._save_todos()
+            self._refresh_all()
             self._log_exception()
             messagebox.showerror(
                 "提醒弹窗失败",

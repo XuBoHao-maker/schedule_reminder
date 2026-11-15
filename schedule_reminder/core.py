@@ -19,7 +19,7 @@ from typing import Any, Iterable
 
 APP_NAME = "Schedule Reminder"
 APP_DISPLAY_NAME = "日程提醒"
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.2.0"
 APP_DIR_NAME = "ScheduleReminder"
 
 MIN_SNOOZE_MINUTES = 1
@@ -125,6 +125,7 @@ class Todo:
     remind_time: time
     created_at: datetime
     snoozed_until: datetime | None = None
+    fired_at: datetime | None = None
     snooze_count: int = 0
 
     @classmethod
@@ -159,7 +160,11 @@ class Todo:
         minutes = parse_snooze_minutes(minutes)
         base = (at or datetime.now()).replace(microsecond=0)
         self.snoozed_until = base + timedelta(minutes=minutes)
+        self.fired_at = None
         self.snooze_count += 1
+
+    def mark_fired(self, *, at: datetime | None = None) -> None:
+        self.fired_at = (at or datetime.now()).replace(microsecond=0)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -171,6 +176,11 @@ class Todo:
             "snoozed_until": (
                 self.snoozed_until.isoformat(timespec="seconds")
                 if self.snoozed_until
+                else None
+            ),
+            "fired_at": (
+                self.fired_at.isoformat(timespec="seconds")
+                if self.fired_at
                 else None
             ),
             "snooze_count": self.snooze_count,
@@ -194,6 +204,10 @@ class Todo:
             )
             if snoozed_until and snoozed_until.tzinfo is not None:
                 snoozed_until = snoozed_until.replace(tzinfo=None)
+            fired_raw = data.get("fired_at")
+            fired_at = datetime.fromisoformat(str(fired_raw)) if fired_raw else None
+            if fired_at and fired_at.tzinfo is not None:
+                fired_at = fired_at.replace(tzinfo=None)
             snooze_count = int(data.get("snooze_count", 0))
             if not isinstance(todo_id, str) or not todo_id:
                 return None
@@ -208,14 +222,19 @@ class Todo:
             remind_time=remind_time,
             created_at=created_at,
             snoozed_until=snoozed_until,
+            fired_at=fired_at,
             snooze_count=snooze_count,
         )
 
 
 def due_todos(todos: Iterable[Todo], at: datetime) -> list[Todo]:
-    """Return due todos, oldest effective due time first."""
+    """Return due, still-pending todos, oldest effective due time first."""
     return sorted(
-        (todo for todo in todos if todo.is_due(at)),
+        (
+            todo
+            for todo in todos
+            if todo.fired_at is None and todo.is_due(at)
+        ),
         key=lambda todo: (todo.effective_due, todo.created_at, todo.title.casefold()),
     )
 

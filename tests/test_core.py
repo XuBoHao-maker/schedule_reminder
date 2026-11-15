@@ -85,6 +85,18 @@ class TodoTests(unittest.TestCase):
         result = due_todos([later, future, earlier], datetime(2026, 11, 20, 10, 0))
         self.assertEqual([todo.title for todo in result], ["earlier", "later"])
 
+    def test_fired_todo_is_retained_but_no_longer_due(self) -> None:
+        todo = Todo.create(
+            "已提醒",
+            date(2026, 11, 20),
+            time(9, 0),
+            created_at=datetime(2026, 11, 15, 9, 0),
+        )
+        todo.mark_fired(at=datetime(2026, 11, 20, 9, 0, 5))
+        self.assertIsNotNone(todo.fired_at)
+        self.assertEqual(todo.fired_at, datetime(2026, 11, 20, 9, 0, 5))
+        self.assertEqual(due_todos([todo], datetime(2026, 11, 20, 10, 0)), [])
+
     def test_todos_for_date(self) -> None:
         base = datetime(2026, 11, 20, 9, 0)
         morning = Todo.create(
@@ -105,6 +117,7 @@ class TodoTests(unittest.TestCase):
             created_at=datetime(2026, 11, 15, 12, 0),
         )
         todo.snooze(5, at=datetime(2026, 11, 20, 9, 30))
+        todo.mark_fired(at=datetime(2026, 11, 20, 9, 35))
         restored = Todo.from_dict(todo.to_dict())
         self.assertIsNotNone(restored)
         assert restored is not None
@@ -112,6 +125,7 @@ class TodoTests(unittest.TestCase):
         self.assertEqual(restored.due_date, todo.due_date)
         self.assertEqual(restored.remind_time, todo.remind_time)
         self.assertEqual(restored.snoozed_until, todo.snoozed_until)
+        self.assertEqual(restored.fired_at, todo.fired_at)
         self.assertEqual(restored.snooze_count, 1)
 
     def test_invalid_dict_is_rejected(self) -> None:
