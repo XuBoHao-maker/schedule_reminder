@@ -24,6 +24,8 @@ class AppSmokeTests(unittest.TestCase):
         os.environ["SCHEDULE_REMINDER_DATA_DIR"] = self.temp_dir.name
         self.old_multi = os.environ.get("SCHEDULE_REMINDER_ALLOW_MULTI")
         os.environ["SCHEDULE_REMINDER_ALLOW_MULTI"] = "1"
+        self.old_skip_version = os.environ.get("SCHEDULE_REMINDER_SKIP_VERSION_DIALOG")
+        os.environ["SCHEDULE_REMINDER_SKIP_VERSION_DIALOG"] = "1"
         self.app = ScheduleReminderApp(self.root)
         self.root.update_idletasks()
         self.root.update()
@@ -32,7 +34,7 @@ class AppSmokeTests(unittest.TestCase):
         try:
             if self.app.reminder_dialog is not None:
                 self.app.reminder_dialog._close()
-            self.app._on_close()
+            self.app.quit_app()
         finally:
             if self.old_data_dir is None:
                 os.environ.pop("SCHEDULE_REMINDER_DATA_DIR", None)
@@ -42,6 +44,10 @@ class AppSmokeTests(unittest.TestCase):
                 os.environ.pop("SCHEDULE_REMINDER_ALLOW_MULTI", None)
             else:
                 os.environ["SCHEDULE_REMINDER_ALLOW_MULTI"] = self.old_multi
+            if self.old_skip_version is None:
+                os.environ.pop("SCHEDULE_REMINDER_SKIP_VERSION_DIALOG", None)
+            else:
+                os.environ["SCHEDULE_REMINDER_SKIP_VERSION_DIALOG"] = self.old_skip_version
             self.temp_dir.cleanup()
 
     def _add_due_todo(self, title: str = "测试提醒") -> Todo:
@@ -123,6 +129,7 @@ class AppSmokeTests(unittest.TestCase):
 
     def test_view_toggle_keeps_selected_date_and_restores_calendar(self) -> None:
         selected = self.app.selected_date
+        self.assertEqual(len(self.app.view_switch.winfo_children()), 2)
         self.app.toggle_view()
         self.root.update()
         self.assertEqual(self.app.view_mode, "timeline")
@@ -132,6 +139,27 @@ class AppSmokeTests(unittest.TestCase):
         self.root.update()
         self.assertEqual(self.app.view_mode, "month")
         self.assertEqual(len(self.app._day_cells), 42)
+
+    def test_close_confirmation_can_be_cancelled(self) -> None:
+        self.app._on_close()
+        self.root.update()
+        self.assertIsNotNone(self.app.close_dialog)
+        assert self.app.close_dialog is not None
+        self.app.close_dialog._cancel()
+        self.root.update()
+        self.assertIsNone(self.app.close_dialog)
+
+    def test_version_dialog_saves_current_version(self) -> None:
+        os.environ.pop("SCHEDULE_REMINDER_SKIP_VERSION_DIALOG", None)
+        self.app._maybe_show_version_dialog()
+        self.root.update()
+        self.assertIsNotNone(self.app.version_dialog)
+        assert self.app.version_dialog is not None
+        self.app.version_dialog._finish()
+        self.root.update()
+        self.assertIsNone(self.app.version_dialog)
+        loaded = self.app.settings_store.load()
+        self.assertEqual(loaded.last_version, "0.3.0")
 
     def test_today_button_visibility_follows_selected_date(self) -> None:
         self.assertFalse(self.app._today_button_visible)

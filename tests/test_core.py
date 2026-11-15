@@ -22,6 +22,15 @@ from schedule_reminder.core import (
     parse_time_text,
     todos_for_date,
 )
+from schedule_reminder.version_notes import is_newer_version, version_tuple
+
+
+class VersionTests(unittest.TestCase):
+    def test_version_comparison(self) -> None:
+        self.assertEqual(version_tuple("v0.3.0"), (0, 3, 0))
+        self.assertTrue(is_newer_version("0.3.0", "0.2.0"))
+        self.assertFalse(is_newer_version("0.3.0", "0.3.0"))
+        self.assertFalse(is_newer_version("0.3.0", ""))
 
 
 class TimeParsingTests(unittest.TestCase):
@@ -184,10 +193,14 @@ class StorageTests(unittest.TestCase):
         path = self.root / "settings.json"
         store = SettingsStore(path)
         self.assertEqual(store.load().snooze_minutes, 5)
-        store.save(Settings(snooze_minutes=17))
-        self.assertEqual(store.load().snooze_minutes, 17)
+        self.assertEqual(store.load().last_version, "")
+        store.save(Settings(snooze_minutes=17, last_version="0.2.0"))
+        loaded = store.load()
+        self.assertEqual(loaded.snooze_minutes, 17)
+        self.assertEqual(loaded.last_version, "0.2.0")
         path.write_text("broken", encoding="utf-8")
         self.assertEqual(store.load().snooze_minutes, 5)
+        self.assertEqual(store.load().last_version, "")
 
     def test_app_paths_env_override(self) -> None:
         old = os.environ.get("SCHEDULE_REMINDER_DATA_DIR")

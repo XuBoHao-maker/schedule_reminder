@@ -19,7 +19,7 @@ from typing import Any, Iterable
 
 APP_NAME = "Schedule Reminder"
 APP_DISPLAY_NAME = "日程提醒"
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.0"
 APP_DIR_NAME = "ScheduleReminder"
 
 MIN_SNOOZE_MINUTES = 1
@@ -344,17 +344,28 @@ class TodoStore:
 @dataclass(slots=True)
 class Settings:
     snooze_minutes: int = 5
+    last_version: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        return {"snooze_minutes": self.snooze_minutes}
+        return {
+            "snooze_minutes": self.snooze_minutes,
+            "last_version": self.last_version,
+        }
 
     @classmethod
     def from_dict(cls, data: Any) -> "Settings":
         if isinstance(data, dict):
             try:
-                return cls(parse_snooze_minutes(data.get("snooze_minutes", 5)))
+                snooze_minutes = parse_snooze_minutes(data.get("snooze_minutes", 5))
             except (TypeError, ValueError, ValidationError):
-                pass
+                snooze_minutes = 5
+            last_version = data.get("last_version", "")
+            if not isinstance(last_version, str):
+                last_version = ""
+            return cls(
+                snooze_minutes=snooze_minutes,
+                last_version=last_version.strip(),
+            )
         return cls()
 
 

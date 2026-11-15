@@ -1,3 +1,2 @@
-# Runtime dependencies: none (Tkinter ships with Python on Windows).
-# Build dependency only:
+-r requirements.txt
 pyinstaller==6.22.3

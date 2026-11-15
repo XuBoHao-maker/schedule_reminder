@@ -26,6 +26,8 @@ if ($LASTEXITCODE -ne 0) {
     --name ScheduleReminder `
     --icon assets/icon.ico `
     --add-data "assets/icon.ico;assets" `
+    --add-data "assets/icon.png;assets" `
+    --hidden-import pystray._win32 `
     --version-file version_info.txt `
     --workpath build `
     --distpath dist `

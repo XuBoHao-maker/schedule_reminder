@@ -5,6 +5,7 @@ from __future__ import annotations
 import calendar
 import ctypes
 import os
+import queue
 import sys
 import traceback
 import tkinter as tk
@@ -12,6 +13,13 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from tkinter import font as tkfont
 from tkinter import messagebox, ttk
+
+try:
+    import pystray
+    from PIL import Image
+except ImportError:  # Tray support is optional for source-only environments.
+    pystray = None
+    Image = None
 
 from .core import (
     APP_DISPLAY_NAME,
@@ -33,6 +41,13 @@ from .core import (
     parse_snooze_minutes,
     parse_time_text,
     todos_for_date,
+)
+from .version_notes import (
+    INTRO_PARAGRAPHS,
+    current_release,
+    format_release,
+    full_history_text,
+    is_newer_version,
 )
 
 COLORS = {
@@ -481,6 +496,315 @@ class ReminderDialog:
         self.app.root.after(30, self.app.check_for_due)
 
 
+class CloseConfirmDialog:
+    """Three-choice close confirmation with tray support."""
+
+    WIDTH = 620
+
+    def __init__(self, app: "ScheduleReminderApp"):
+        self.app = app
+        self.closed = False
+        self.window = tk.Toplevel(app.root)
+        self.window.withdraw()
+        self.window.overrideredirect(True)
+        self.window.transient(app.root)
+        self.window.attributes("-topmost", True)
+        self.window.configure(bg=COLORS["line_strong"])
+        self.window.protocol("WM_DELETE_WINDOW", lambda: None)
+        self.window.bind("<Escape>", lambda _event: self._cancel())
+
+        card = tk.Frame(self.window, bg=COLORS["card"])
+        card.pack(fill="both", expand=True, padx=1, pady=1)
+        header = tk.Frame(card, bg=COLORS["card"])
+        header.pack(fill="x", padx=28, pady=(24, 0))
+        logo = tk.Canvas(
+            header, width=48, height=48, bg=COLORS["card"], highlightthickness=0
+        )
+        _draw_calendar_logo(logo, 48)
+        logo.pack(side="left")
+        tk.Label(
+            header,
+            text="关闭应用",
+            bg=COLORS["card"],
+            fg=COLORS["ink"],
+            font=(app.font_family, 17, "bold"),
+        ).pack(side="left", padx=(12, 0))
+
+        tk.Label(
+            card,
+            text=(
+                "您确定要关闭该应用吗，关闭后日程将不会提醒您了，"
+                "您可以选择把应用最小化到系统托盘。"
+            ),
+            bg=COLORS["card"],
+            fg=COLORS["ink_soft"],
+            font=(app.font_family, 10),
+            anchor="w",
+            justify="left",
+            wraplength=560,
+        ).pack(fill="x", padx=28, pady=(15, 0))
+        tk.Label(
+            card,
+            text="最小化到系统托盘后，程序仍在后台运行，到点仍会提醒。",
+            bg=COLORS["card"],
+            fg=COLORS["muted"],
+            font=(app.font_family, 8),
+            anchor="w",
+            justify="left",
+            wraplength=560,
+        ).pack(fill="x", padx=28, pady=(6, 0))
+
+        buttons = tk.Frame(card, bg=COLORS["card"])
+        buttons.pack(fill="x", padx=24, pady=(20, 22))
+        for column in range(3):
+            buttons.grid_columnconfigure(column, weight=1)
+        confirm = app.make_button(
+            buttons, "确认关闭", self._confirm, kind="ghost"
+        )
+        confirm.configure(
+            fg=COLORS["red"],
+            activeforeground=COLORS["red"],
+            highlightbackground=COLORS["red"],
+        )
+        confirm.grid(row=0, column=0, sticky="ew", padx=4)
+        tray = app.make_button(
+            buttons,
+            "把应用最小化到系统托盘",
+            self._minimize_to_tray,
+            kind="primary",
+        )
+        tray.grid(row=0, column=1, sticky="ew", padx=4)
+        cancel = app.make_button(
+            buttons, "取消关闭", self._cancel, kind="ghost"
+        )
+        cancel.grid(row=0, column=2, sticky="ew", padx=4)
+
+        self.window.update_idletasks()
+        height = max(230, self.window.winfo_reqheight())
+        x = (self.window.winfo_screenwidth() - self.WIDTH) // 2
+        y = max(20, (self.window.winfo_screenheight() - height) // 2)
+        self.window.geometry(f"{self.WIDTH}x{height}+{x}+{y}")
+        self.window.deiconify()
+        self.window.lift()
+        self.window.attributes("-topmost", True)
+        self.window.grab_set()
+        self.window.after(80, self._focus)
+
+    def _focus(self) -> None:
+        if self.closed:
+            return
+        try:
+            self.window.focus_force()
+        except tk.TclError:
+            pass
+
+    def bring_to_front(self) -> None:
+        if self.closed:
+            return
+        self.window.deiconify()
+        self.window.lift()
+        self.window.attributes("-topmost", True)
+        self.window.focus_force()
+
+    def _confirm(self) -> None:
+        if self.closed:
+            return
+        self.app.quit_app()
+
+    def _minimize_to_tray(self) -> None:
+        if self.closed:
+            return
+        if self.app.minimize_to_tray():
+            self._close()
+
+    def _cancel(self) -> None:
+        if self.closed:
+            return
+        self._close()
+
+    def _close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            self.window.grab_release()
+            self.window.destroy()
+        except tk.TclError:
+            pass
+        if self.app.close_dialog is self:
+            self.app.close_dialog = None
+
+
+class VersionDialog:
+    """First-run introduction or post-update release notes."""
+
+    WIDTH = 620
+
+    def __init__(
+        self,
+        app: "ScheduleReminderApp",
+        *,
+        first_run: bool,
+    ):
+        self.app = app
+        self.closed = False
+        self.window = tk.Toplevel(app.root)
+        self.window.withdraw()
+        self.window.overrideredirect(True)
+        self.window.transient(app.root)
+        self.window.attributes("-topmost", True)
+        self.window.configure(bg=COLORS["line_strong"])
+        self.window.protocol("WM_DELETE_WINDOW", lambda: None)
+        self.window.bind("<Escape>", lambda _event: "break")
+
+        card = tk.Frame(self.window, bg=COLORS["card"])
+        card.pack(fill="both", expand=True, padx=1, pady=1)
+        header = tk.Frame(card, bg=COLORS["card"])
+        header.pack(fill="x", padx=28, pady=(24, 0))
+        logo = tk.Canvas(
+            header, width=50, height=50, bg=COLORS["card"], highlightthickness=0
+        )
+        _draw_calendar_logo(logo, 50)
+        logo.pack(side="left")
+        heading = tk.Frame(header, bg=COLORS["card"])
+        heading.pack(side="left", padx=(12, 0))
+        tk.Label(
+            heading,
+            text="欢迎使用" if first_run else f"已更新到 v{APP_VERSION}",
+            bg=COLORS["card"],
+            fg=COLORS["ink"],
+            font=(app.font_family, 16, "bold"),
+        ).pack(anchor="w")
+        tk.Label(
+            heading,
+            text="日程提醒" if first_run else "本次版本更新内容",
+            bg=COLORS["card"],
+            fg=COLORS["accent_deep"] if first_run else COLORS["muted"],
+            font=(app.font_family, 9),
+        ).pack(anchor="w", pady=(2, 0))
+
+        if first_run:
+            intro = "\n".join(INTRO_PARAGRAPHS)
+            tk.Label(
+                card,
+                text=intro,
+                bg=COLORS["card"],
+                fg=COLORS["ink_soft"],
+                font=(app.font_family, 9),
+                anchor="w",
+                justify="left",
+                wraplength=560,
+            ).pack(fill="x", padx=28, pady=(14, 0))
+            history_title = "历史版本更新日志"
+            history = full_history_text()
+        else:
+            tk.Label(
+                card,
+                text="下面是本次版本的主要变化。",
+                bg=COLORS["card"],
+                fg=COLORS["ink_soft"],
+                font=(app.font_family, 9),
+                anchor="w",
+            ).pack(fill="x", padx=28, pady=(14, 0))
+            history_title = f"v{APP_VERSION} 更新内容"
+            release = current_release()
+            history = format_release(release) if release else "本次没有额外的更新说明。"
+
+        tk.Label(
+            card,
+            text=history_title,
+            bg=COLORS["card"],
+            fg=COLORS["ink"],
+            font=(app.font_family, 9, "bold"),
+            anchor="w",
+        ).pack(fill="x", padx=28, pady=(14, 4))
+
+        text_frame = tk.Frame(card, bg=COLORS["card"])
+        text_frame.pack(fill="both", expand=True, padx=28)
+        text = tk.Text(
+            text_frame,
+            height=12,
+            wrap="word",
+            bg=COLORS["warm"],
+            fg=COLORS["ink_soft"],
+            relief="flat",
+            bd=0,
+            highlightthickness=1,
+            highlightbackground=COLORS["line"],
+            font=(app.font_family, 9),
+            padx=12,
+            pady=9,
+            spacing1=2,
+            spacing3=4,
+            cursor="arrow",
+        )
+        scrollbar = tk.Scrollbar(
+            text_frame, orient="vertical", command=text.yview, width=11
+        )
+        text.configure(yscrollcommand=scrollbar.set)
+        text.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        text.insert("1.0", history)
+        text.configure(state="disabled")
+
+        tk.Label(
+            card,
+            text="关闭此窗口后将保存当前版本号。",
+            bg=COLORS["card"],
+            fg=COLORS["muted"],
+            font=(app.font_family, 8),
+            anchor="w",
+        ).pack(fill="x", padx=28, pady=(8, 0))
+
+        footer = tk.Frame(card, bg=COLORS["card"])
+        footer.pack(fill="x", padx=28, pady=(12, 22))
+        enter = app.make_button(
+            footer, "进入应用", self._finish, kind="primary"
+        )
+        enter.pack(side="right")
+
+        self.window.update_idletasks()
+        height = min(
+            max(520, self.window.winfo_reqheight()),
+            self.window.winfo_screenheight() - 60,
+        )
+        x = (self.window.winfo_screenwidth() - self.WIDTH) // 2
+        y = max(20, (self.window.winfo_screenheight() - height) // 2)
+        self.window.geometry(f"{self.WIDTH}x{height}+{x}+{y}")
+        self.window.deiconify()
+        self.window.lift()
+        self.window.attributes("-topmost", True)
+        self.window.grab_set()
+        self.window.after(80, self._focus)
+
+    def _focus(self) -> None:
+        if self.closed:
+            return
+        try:
+            self.window.focus_force()
+        except tk.TclError:
+            pass
+
+    def bring_to_front(self) -> None:
+        if self.closed:
+            return
+        self.window.deiconify()
+        self.window.lift()
+        self.window.attributes("-topmost", True)
+        self.window.focus_force()
+
+    def _finish(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            self.window.grab_release()
+            self.window.destroy()
+        except tk.TclError:
+            pass
+        self.app.finish_version_dialog(self)
+
+
 class ScheduleReminderApp:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -505,6 +829,11 @@ class ScheduleReminderApp:
         self.time_picker_open = False
         self._today_button_visible = True
         self.reminder_dialog: ReminderDialog | None = None
+        self.close_dialog: CloseConfirmDialog | None = None
+        self.version_dialog: VersionDialog | None = None
+        self.tray_icon = None
+        self.tray_image = None
+        self._tray_queue: queue.Queue[str] = queue.Queue()
         self._closing = False
         self._day_cells: list[DayCell] = []
         self._calendar_initialized = False
@@ -533,6 +862,8 @@ class ScheduleReminderApp:
         self.root.after(300, self.check_for_due)
         self.root.after(1000, self._tick)
         self.root.after(120, self.title_entry.focus_set)
+        self.root.after(200, self._maybe_show_version_dialog)
+        self.root.after(250, self._poll_tray_actions)
 
     def _set_window_geometry(self) -> None:
         width, height = 1120, 720
@@ -551,6 +882,141 @@ class ScheduleReminderApp:
                 self.root.iconbitmap(default=str(icon))
             except tk.TclError:
                 pass
+
+    def _maybe_show_version_dialog(self) -> None:
+        if self._closing or self.version_dialog is not None:
+            return
+        if os.environ.get("SCHEDULE_REMINDER_SKIP_VERSION_DIALOG") == "1":
+            return
+        stored = self.settings.last_version
+        first_run = not stored.strip()
+        if not first_run and not is_newer_version(APP_VERSION, stored):
+            return
+        try:
+            self.version_dialog = VersionDialog(self, first_run=first_run)
+        except Exception:
+            self._log_exception()
+            messagebox.showerror(
+                "版本信息",
+                "无法显示版本介绍，程序将继续运行。",
+                parent=self.root,
+            )
+
+    def finish_version_dialog(self, dialog: VersionDialog) -> None:
+        if self.version_dialog is not dialog:
+            return
+        self.version_dialog = None
+        self.settings.last_version = APP_VERSION
+        try:
+            self.settings_store.save(self.settings)
+        except StorageError as exc:
+            messagebox.showwarning(
+                "保存版本记录失败",
+                str(exc),
+                parent=self.root,
+            )
+        self.root.after(80, self.check_for_due)
+
+    def minimize_to_tray(self) -> bool:
+        if not self._ensure_tray():
+            return False
+        try:
+            self.root.withdraw()
+        except tk.TclError:
+            return False
+        return True
+
+    def _ensure_tray(self) -> bool:
+        if self.tray_icon is not None:
+            return True
+        if pystray is None or Image is None:
+            messagebox.showerror(
+                "系统托盘不可用",
+                "缺少 pystray/Pillow 依赖，无法最小化到系统托盘。",
+                parent=self.root,
+            )
+            return False
+        icon_path = resource_path("assets/icon.png")
+        try:
+            self.tray_image = Image.open(icon_path)
+            menu = pystray.Menu(
+                pystray.MenuItem(
+                    "打开主界面",
+                    lambda _icon, _item: self._tray_action("show"),
+                    default=True,
+                ),
+                pystray.MenuItem(
+                    "退出",
+                    lambda _icon, _item: self._tray_action("quit"),
+                ),
+            )
+            self.tray_icon = pystray.Icon(
+                "ScheduleReminder",
+                self.tray_image,
+                APP_DISPLAY_NAME,
+                menu,
+            )
+            self.tray_icon.run_detached()
+        except Exception as exc:
+            self.tray_icon = None
+            self._log_exception()
+            messagebox.showerror(
+                "系统托盘不可用",
+                f"无法创建系统托盘图标：{exc}",
+                parent=self.root,
+            )
+            return False
+        return True
+
+    def _tray_action(self, action: str) -> None:
+        self._tray_queue.put(action)
+
+    def _poll_tray_actions(self) -> None:
+        if self._closing:
+            return
+        while True:
+            try:
+                action = self._tray_queue.get_nowait()
+            except queue.Empty:
+                break
+            if action == "show":
+                self._restore_from_tray()
+            elif action == "quit":
+                self.quit_app()
+                return
+        self.root.after(150, self._poll_tray_actions)
+
+    def _restore_from_tray(self) -> None:
+        if self._closing:
+            return
+        try:
+            self.root.deiconify()
+            self.root.lift()
+            self.root.focus_force()
+        except tk.TclError:
+            return
+        if self.reminder_dialog is not None:
+            self.reminder_dialog.bring_to_front()
+
+    def quit_app(self) -> None:
+        if self._closing:
+            return
+        self._closing = True
+        if self.tray_icon is not None:
+            try:
+                self.tray_icon.stop()
+            except Exception:
+                pass
+            self.tray_icon = None
+        try:
+            for after_id in self.root.tk.splitlist(self.root.tk.call("after", "info")):
+                self.root.after_cancel(after_id)
+        except tk.TclError:
+            pass
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
 
     def _build_ui(self) -> None:
         family = self.font_family
@@ -626,20 +1092,12 @@ class ScheduleReminderApp:
         )
         self.prev_button.pack(side="left")
 
-        self.view_toggle = tk.Canvas(
-            month_bar,
-            width=36,
-            height=36,
-            bg=COLORS["card"],
-            highlightthickness=1,
-            highlightbackground=COLORS["line"],
-            cursor="hand2",
-            takefocus=1,
-        )
-        self.view_toggle.pack(side="right", padx=(8, 0))
-        self.view_toggle.bind("<Button-1>", lambda _event: self.toggle_view())
-        self.view_toggle.bind("<Return>", lambda _event: self.toggle_view())
-        self.view_toggle.bind("<space>", lambda _event: self.toggle_view())
+        self.view_switch = tk.Frame(month_bar, bg=COLORS["card"])
+        self.view_switch.pack(side="right", padx=(8, 0))
+        self.month_view_icon = self._make_view_icon("month")
+        self.month_view_icon.pack(side="left", padx=2)
+        self.timeline_view_icon = self._make_view_icon("timeline")
+        self.timeline_view_icon.pack(side="left", padx=2)
 
         self.next_button = self.make_button(
             month_bar, "›", self.next_month, kind="circle"
@@ -701,7 +1159,32 @@ class ScheduleReminderApp:
         self.month_picker_card.pack(fill="both", expand=True, padx=1, pady=1)
 
         self._show_month_layout()
-        self._draw_view_toggle()
+        self._draw_view_icons()
+
+    def _make_view_icon(self, mode: str) -> tk.Canvas:
+        canvas = tk.Canvas(
+            self.view_switch,
+            width=34,
+            height=34,
+            bg=COLORS["card"],
+            highlightthickness=1,
+            highlightbackground=COLORS["line"],
+            cursor="hand2",
+            takefocus=1,
+        )
+        canvas.bind(
+            "<Button-1>",
+            lambda _event, selected=mode: self.set_view_mode(selected),
+        )
+        canvas.bind(
+            "<Return>",
+            lambda _event, selected=mode: self.set_view_mode(selected),
+        )
+        canvas.bind(
+            "<space>",
+            lambda _event, selected=mode: self.set_view_mode(selected),
+        )
+        return canvas
 
     def _show_month_layout(self) -> None:
         self.timeline_scroll.pack_forget()
@@ -716,42 +1199,65 @@ class ScheduleReminderApp:
         if not self.timeline_scroll.winfo_ismapped():
             self.timeline_scroll.pack(fill="both", expand=True)
 
-    def _draw_view_toggle(self) -> None:
-        canvas = self.view_toggle
-        canvas.delete("all")
-        canvas.create_rectangle(
-            7,
-            7,
-            29,
-            29,
-            outline=COLORS["ink_soft"],
-            width=1,
-        )
-        if self.view_mode == "month":
-            for x, y in ((10, 10), (20, 10), (10, 20), (20, 20)):
+    def _draw_view_icons(self) -> None:
+        for canvas, mode in (
+            (self.month_view_icon, "month"),
+            (self.timeline_view_icon, "timeline"),
+        ):
+            active = self.view_mode == mode
+            background = COLORS["accent_soft"] if active else COLORS["card"]
+            border = COLORS["accent"] if active else COLORS["line"]
+            foreground = COLORS["accent_deep"] if active else COLORS["muted"]
+            canvas.configure(bg=background, highlightbackground=border)
+            canvas.delete("all")
+            canvas.create_rectangle(
+                7,
+                7,
+                27,
+                27,
+                outline=foreground,
+                width=1,
+            )
+            if mode == "month":
+                for x, y in ((10, 10), (19, 10), (10, 19), (19, 19)):
+                    canvas.create_rectangle(
+                        x,
+                        y,
+                        x + 5,
+                        y + 5,
+                        outline=foreground,
+                        fill=COLORS["accent_soft"] if active else "",
+                        width=1,
+                    )
+            else:
                 canvas.create_rectangle(
-                    x,
-                    y,
-                    x + 6,
-                    y + 6,
-                    outline=COLORS["accent"],
-                    fill=COLORS["accent_soft"],
-                    width=1,
+                    10,
+                    11,
+                    24,
+                    14,
+                    outline=foreground,
+                    fill=COLORS["accent_soft"] if active else "",
                 )
-        else:
-            canvas.create_rectangle(
-                10, 11, 26, 15, outline=COLORS["accent"], fill=COLORS["accent_soft"]
-            )
-            canvas.create_rectangle(
-                10, 21, 26, 25, outline=COLORS["accent"], fill=COLORS["accent_soft"]
-            )
+                canvas.create_rectangle(
+                    10,
+                    20,
+                    24,
+                    23,
+                    outline=foreground,
+                    fill=COLORS["accent_soft"] if active else "",
+                )
 
-    def toggle_view(self) -> None:
+    def set_view_mode(self, mode: str) -> None:
+        if mode not in ("month", "timeline") or mode == self.view_mode:
+            return
         self.hide_month_picker()
         self.hide_time_picker()
-        self.view_mode = "timeline" if self.view_mode == "month" else "month"
-        self._draw_view_toggle()
+        self.view_mode = mode
+        self._draw_view_icons()
         self._refresh_calendar()
+
+    def toggle_view(self) -> None:
+        self.set_view_mode("timeline" if self.view_mode == "month" else "month")
 
     def _build_panel(self, parent: tk.Frame) -> None:
         family = self.font_family
@@ -1686,7 +2192,12 @@ class ScheduleReminderApp:
         return True
 
     def check_for_due(self) -> None:
-        if self._closing or self.reminder_dialog is not None:
+        if (
+            self._closing
+            or self.reminder_dialog is not None
+            or self.version_dialog is not None
+            or self.close_dialog is not None
+        ):
             return
         due = due_todos(self.todos, datetime.now())
         if due:
@@ -1741,16 +2252,24 @@ class ScheduleReminderApp:
         return self.reminder_dialog.window if self.reminder_dialog else self.root
 
     def _on_close(self) -> None:
+        if self.version_dialog is not None:
+            self.version_dialog.bring_to_front()
+            return
+        if self.close_dialog is not None:
+            self.close_dialog.bring_to_front()
+            return
         if self.reminder_dialog is not None:
             self.reminder_dialog.bring_to_front()
             return
-        self._closing = True
         try:
-            for after_id in self.root.tk.splitlist(self.root.tk.call("after", "info")):
-                self.root.after_cancel(after_id)
-        except tk.TclError:
-            pass
-        self.root.destroy()
+            self.close_dialog = CloseConfirmDialog(self)
+        except Exception:
+            self._log_exception()
+            messagebox.showerror(
+                "关闭应用",
+                "无法显示关闭确认窗口，程序将继续运行。",
+                parent=self.root,
+            )
 
     def _log_exception(self) -> None:
         try:
