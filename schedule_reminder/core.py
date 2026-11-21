@@ -19,7 +19,7 @@ from typing import Any, Iterable
 
 APP_NAME = "Schedule Reminder"
 APP_DISPLAY_NAME = "日程提醒"
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.4.0"
 APP_DIR_NAME = "ScheduleReminder"
 
 MIN_SNOOZE_MINUTES = 1

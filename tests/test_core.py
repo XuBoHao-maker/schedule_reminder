@@ -27,10 +27,10 @@ from schedule_reminder.version_notes import is_newer_version, version_tuple
 
 class VersionTests(unittest.TestCase):
     def test_version_comparison(self) -> None:
-        self.assertEqual(version_tuple("v0.3.0"), (0, 3, 0))
-        self.assertTrue(is_newer_version("0.3.0", "0.2.0"))
-        self.assertFalse(is_newer_version("0.3.0", "0.3.0"))
-        self.assertFalse(is_newer_version("0.3.0", ""))
+        self.assertEqual(version_tuple("v0.4.0"), (0, 4, 0))
+        self.assertTrue(is_newer_version("0.4.0", "0.3.0"))
+        self.assertFalse(is_newer_version("0.4.0", "0.4.0"))
+        self.assertFalse(is_newer_version("0.4.0", ""))
 
 
 class TimeParsingTests(unittest.TestCase):

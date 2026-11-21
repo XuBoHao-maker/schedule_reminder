@@ -159,7 +159,7 @@ class AppSmokeTests(unittest.TestCase):
         self.root.update()
         self.assertIsNone(self.app.version_dialog)
         loaded = self.app.settings_store.load()
-        self.assertEqual(loaded.last_version, "0.3.0")
+        self.assertEqual(loaded.last_version, "0.4.0")
 
     def test_today_button_visibility_follows_selected_date(self) -> None:
         self.assertFalse(self.app._today_button_visible)
@@ -175,10 +175,8 @@ class AppSmokeTests(unittest.TestCase):
         self.app.show_time_picker()
         self.root.update()
         self.assertTrue(self.app.time_picker_open)
-        self.app._time_hour_list.selection_clear(0, "end")
-        self.app._time_hour_list.selection_set(14)
-        self.app._time_minute_list.selection_clear(0, "end")
-        self.app._time_minute_list.selection_set(45)
+        self.app._time_hour_wheel.set_value(14)
+        self.app._time_minute_wheel.set_value(45)
         self.app.confirm_time_picker()
         self.assertEqual(self.app.time_var.get(), "14:45")
         self.assertFalse(self.app.time_picker_open)
@@ -188,6 +186,124 @@ class AppSmokeTests(unittest.TestCase):
         self.root.update()
         self.app.hide_time_picker()
         self.assertEqual(self.app.time_var.get(), "08:15")
+
+    def test_time_wheels_wrap_in_both_directions(self) -> None:
+        self.app.show_time_picker()
+        self.root.update()
+        hour = self.app._time_hour_wheel
+        minute = self.app._time_minute_wheel
+        hour.set_value(23)
+        hour.shift(1)
+        self.assertEqual(hour.get_value(), 0)
+        hour.shift(-1)
+        self.assertEqual(hour.get_value(), 23)
+        minute.set_value(59)
+        minute.shift(1)
+        self.assertEqual(minute.get_value(), 0)
+        minute.shift(-1)
+        self.assertEqual(minute.get_value(), 59)
+        self.app.hide_time_picker()
+
+    def test_edit_dialog_updates_name_and_time(self) -> None:
+        due_day = date.today() + timedelta(days=2)
+        todo = Todo.create("修改前", due_day, datetime.min.time().replace(hour=9))
+        self.app.todos.append(todo)
+        self.app._refresh_all()
+        self.app.open_edit_dialog(todo.id)
+        self.root.update()
+        dialog = self.app.edit_dialog
+        self.assertIsNotNone(dialog)
+        assert dialog is not None
+        self.assertEqual(dialog.title_var.get(), "修改前")
+        self.assertEqual(dialog.time_var.get(), "09:00")
+        dialog.title_var.set("修改后")
+        dialog.time_var.set("16:45")
+        dialog._confirm()
+        self.root.update()
+        self.assertIsNone(self.app.edit_dialog)
+        self.assertEqual(todo.title, "修改后")
+        self.assertEqual(todo.remind_time.strftime("%H:%M"), "16:45")
+
+    def test_fired_todo_can_be_edited_without_losing_history(self) -> None:
+        now = datetime.now().replace(microsecond=0)
+        todo = Todo.create("已提醒待办", date.today(), now.time())
+        todo.mark_fired(at=now)
+        self.app.todos.append(todo)
+        self.app.open_edit_dialog(todo.id)
+        self.root.update()
+        dialog = self.app.edit_dialog
+        assert dialog is not None
+        dialog.title_var.set("改名后仍是历史")
+        dialog._confirm()
+        self.root.update()
+        self.assertEqual(todo.title, "改名后仍是历史")
+        self.assertIsNotNone(todo.fired_at)
+
+    def test_future_edit_rearms_fired_todo(self) -> None:
+        now = datetime.now().replace(microsecond=0)
+        todo = Todo.create(
+            "重新提醒",
+            date.today() + timedelta(days=1),
+            now.time().replace(second=0, microsecond=0),
+        )
+        todo.mark_fired(at=now)
+        self.app.todos.append(todo)
+        self.app.open_edit_dialog(todo.id)
+        self.root.update()
+        dialog = self.app.edit_dialog
+        assert dialog is not None
+        dialog.time_var.set("17:30")
+        dialog._confirm()
+        self.root.update()
+        self.assertIsNone(todo.fired_at)
+
+    def test_today_cell_matches_primary_action_color(self) -> None:
+        today_cell = next(cell for cell in self.app._day_cells if cell.today)
+        self.assertEqual(today_cell.cget("bg"), self.app.add_button.cget("bg"))
+
+    def test_timeline_today_group_is_emphasized(self) -> None:
+        self.app.set_view_mode("timeline")
+        self.root.update()
+        frame = self.app._timeline_today_frame
+        self.assertIsNotNone(frame)
+        assert frame is not None
+        self.assertEqual(int(frame.cget("highlightthickness")), 2)
+
+    def test_todo_row_has_edit_before_delete(self) -> None:
+        due_day = date.today() + timedelta(days=1)
+        todo = Todo.create("按钮顺序", due_day, datetime.min.time().replace(hour=9))
+        self.app.todos.append(todo)
+        self.app.selected_date = due_day
+        self.app._refresh_all()
+        self.root.update()
+        row = self.app.todo_scroll.inner.winfo_children()[0]
+        labels = self._button_texts(row)
+        self.assertEqual(labels, ["修改", "删除"])
+
+    def test_reminder_dialog_has_no_footer_explanation(self) -> None:
+        self._add_due_todo("无底部说明")
+        dialog = self.app.reminder_dialog
+        assert dialog is not None
+        texts = self._label_texts(dialog.card)
+        self.assertFalse(any("不会自动关闭" in text for text in texts))
+        dialog._cancel()
+        self.root.update()
+
+    def _button_texts(self, widget: tk.Misc) -> list[str]:
+        texts: list[str] = []
+        for child in widget.winfo_children():
+            if isinstance(child, tk.Button):
+                texts.append(str(child.cget("text")))
+            texts.extend(self._button_texts(child))
+        return texts
+
+    def _label_texts(self, widget: tk.Misc) -> list[str]:
+        texts: list[str] = []
+        for child in widget.winfo_children():
+            if isinstance(child, tk.Label):
+                texts.append(str(child.cget("text")))
+            texts.extend(self._label_texts(child))
+        return texts
 
     def test_month_picker_changes_calendar_view(self) -> None:
         self.app.toggle_month_picker()
